@@ -26,7 +26,7 @@ namespace cartographer_ros {
 
 namespace {
 
-constexpr double kTrajectoryLineStripMarkerScale = 0.07;
+constexpr double kTrajectoryLineStripMarkerScale = 5 * 0.07;
 constexpr double kConstraintMarkerScale = 0.025;
 
 ::std_msgs::ColorRGBA ToMessage(const cartographer::io::FloatColor& color) {
@@ -262,27 +262,39 @@ visualization_msgs::MarkerArray MapBuilderBridge::GetConstraintList() {
   const auto submap_poses = map_builder_->pose_graph()->GetAllSubmapPoses();
   const auto constraints = map_builder_->pose_graph()->constraints();
 
+  int la = 0;
   for (const auto& constraint : constraints) {
     visualization_msgs::Marker *constraint_marker, *residual_marker;
     std_msgs::ColorRGBA color_constraint, color_residual;
     if (constraint.tag ==
         cartographer::mapping::PoseGraph::Constraint::INTRA_SUBMAP) {
+      ++la;
+      if (la % 5 != 0) {
+        continue;
+      }
       constraint_marker = &constraint_intra_marker;
       residual_marker = &residual_intra_marker;
       // Color mapping for submaps of various trajectories - add trajectory id
       // to ensure different starting colors. Also add a fixed offset of 25
       // to avoid having identical colors as trajectories.
-      color_constraint = ToMessage(
-          cartographer::io::GetColor(constraint.submap_id.submap_index +
-                                     constraint.submap_id.trajectory_id + 25));
+      // Bright red
+      color_constraint.a = 1.0;
+      color_constraint.r = 1.0;
+      color_constraint.g = color_constraint.b = 0.3;
       color_residual.a = 1.0;
       color_residual.r = 1.0;
     } else {
       constraint_marker = &constraint_inter_marker;
       residual_marker = &residual_inter_marker;
-      // Bright yellow
+      // Yellow
       color_constraint.a = 1.0;
       color_constraint.r = color_constraint.g = 1.0;
+      if (constraint.submap_id.trajectory_id != constraint.node_id.trajectory_id) {
+        // Bright orange
+        color_constraint.r = 1.0;
+        color_constraint.g = 0.7;
+        color_constraint.b = 0.3;
+      }
       // Bright cyan
       color_residual.a = 1.0;
       color_residual.b = color_residual.g = 1.0;

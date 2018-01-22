@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
   CHECK(!FLAGS_configuration_basename.empty())
       << "-configuration_basename is missing.";
 
+  sleep(1);
   ::ros::init(argc, argv, "cartographer_grpc_node");
   ::ros::start();
 

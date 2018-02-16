@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 The Cartographer Authors
+ * Copyright 2018 The Cartographer Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+// Publishes a frozen nav_msgs/OccupancyGrid map from serialized submaps.
+
 #include <map>
 #include <string>
 
@@ -22,32 +24,35 @@
 #include "cartographer/mapping/proto/pose_graph.pb.h"
 #include "cartographer/mapping/proto/serialization.pb.h"
 #include "cartographer/mapping/proto/submap.pb.h"
-#include "cartographer/mapping/proto/trajectory_builder_options.pb.h"
+#include "cartographer/mapping/submaps.h"
 #include "cartographer/mapping_2d/probability_grid.h"
 #include "cartographer/mapping_2d/submaps.h"
 #include "cartographer/mapping_3d/submaps.h"
+#include "cartographer_ros/msg_conversion.h"
+#include "cartographer_ros/node_constants.h"
+#include "cartographer_ros/ros_log_sink.h"
 #include "cartographer_ros/ros_map.h"
 #include "cartographer_ros/submap.h"
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "nav_msgs/OccupancyGrid.h"
+#include "ros/ros.h"
 
 DEFINE_string(pbstream_filename, "",
               "Filename of a pbstream to draw a map from.");
-DEFINE_string(map_filestem, "map", "Stem of the output files.");
+DEFINE_string(map_topic, "map", "Name of the published map topic.");
+DEFINE_string(map_frame_id, "map", "Frame ID of the published map.");
 DEFINE_double(resolution, 0.05, "Resolution of a grid cell in the drawn map.");
 
 namespace cartographer_ros {
 namespace {
 
-void Run(const std::string& pbstream_filename, const std::string& map_filestem,
-         const double resolution) {
+void Run(const std::string& pbstream_filename, const std::string& map_topic,
+         const std::string& map_frame_id, const double resolution) {
   ::cartographer::io::ProtoStreamReader reader(pbstream_filename);
 
   ::cartographer::mapping::proto::PoseGraph pose_graph;
   CHECK(reader.ReadProto(&pose_graph));
-  ::cartographer::mapping::proto::AllTrajectoryBuilderOptions
-      all_trajectory_builder_options;
-  CHECK(reader.ReadProto(&all_trajectory_builder_options));
 
   LOG(INFO) << "Loading submap slices from serialized data.";
   std::map<::cartographer::mapping::SubmapId, ::cartographer::io::SubmapSlice>
@@ -72,21 +77,22 @@ void Run(const std::string& pbstream_filename, const std::string& map_filestem,
   }
   CHECK(reader.eof());
 
+  ::ros::NodeHandle node_handle("");
+  ::ros::Publisher pub = node_handle.advertise<nav_msgs::OccupancyGrid>(
+      map_topic, kLatestOnlyPublisherQueueSize, true /*latched */);
+
   LOG(INFO) << "Generating combined map image from submap slices.";
-  auto result =
+  const auto painted_slices =
       ::cartographer::io::PaintSubmapSlices(submap_slices, resolution);
+  std::unique_ptr<nav_msgs::OccupancyGrid> msg_ptr = CreateOccupancyGridMsg(
+      painted_slices, resolution, FLAGS_map_frame_id, ros::Time::now());
 
-  ::cartographer::io::StreamFileWriter pgm_writer(map_filestem + ".pgm");
-
-  ::cartographer::io::Image image(std::move(result.surface));
-  WritePgm(image, resolution, &pgm_writer);
-
-  const Eigen::Vector2d origin(
-      -result.origin.x() * resolution,
-      (result.origin.y() - image.height()) * resolution);
-
-  ::cartographer::io::StreamFileWriter yaml_writer(map_filestem + ".yaml");
-  WriteYaml(resolution, origin, pgm_writer.GetFilename(), &yaml_writer);
+  LOG(INFO) << "Publishing occupancy grid topic " << map_topic
+            << " (frame_id: " << map_frame_id
+            << ", resolution:" << std::to_string(resolution) << ").";
+  pub.publish(*msg_ptr);
+  ::ros::spin();
+  ::ros::shutdown();
 }
 
 }  // namespace
@@ -98,8 +104,12 @@ int main(int argc, char** argv) {
   google::ParseCommandLineFlags(&argc, &argv, true);
 
   CHECK(!FLAGS_pbstream_filename.empty()) << "-pbstream_filename is missing.";
-  CHECK(!FLAGS_map_filestem.empty()) << "-map_filestem is missing.";
 
-  ::cartographer_ros::Run(FLAGS_pbstream_filename, FLAGS_map_filestem,
-                          FLAGS_resolution);
+  ::ros::init(argc, argv, "cartographer_pbstream_map_publisher");
+  ::ros::start();
+
+  cartographer_ros::ScopedRosLogSink ros_log_sink;
+
+  ::cartographer_ros::Run(FLAGS_pbstream_filename, FLAGS_map_topic,
+                          FLAGS_map_frame_id, FLAGS_resolution);
 }

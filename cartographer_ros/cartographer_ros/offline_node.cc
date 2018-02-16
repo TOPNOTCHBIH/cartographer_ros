@@ -23,20 +23,35 @@
 #include <chrono>
 
 #include "cartographer_ros/node.h"
+#include "cartographer_ros/playable_bag.h"
+#include "cartographer_ros/split_string.h"
 #include "cartographer_ros/urdf_reader.h"
+#include "gflags/gflags.h"
 #include "ros/callback_queue.h"
-#include "rosbag/bag.h"
-#include "rosbag/view.h"
 #include "rosgraph_msgs/Clock.h"
-#include "tf2_msgs/TFMessage.h"
 #include "tf2_ros/static_transform_broadcaster.h"
 #include "urdf/model.h"
 
+DEFINE_string(configuration_directory, "",
+              "First directory in which configuration files are searched, "
+              "second is always the Cartographer installation to allow "
+              "including files from there.");
 DEFINE_string(
-    urdf_filename, "",
-    "URDF file that contains static links for your sensor configuration.");
+    configuration_basenames, "",
+    "Comma-separated list of basenames, i.e. not containing any "
+    "directory prefix, of the configuration files for each trajectory. "
+    "The first configuration file will be used for node options. "
+    "If less configuration files are specified than trajectories, the "
+    "first file will be used the remaining trajectories.");
+DEFINE_string(
+    bag_filenames, "",
+    "Comma-separated list of bags to process. One bag per trajectory. "
+    "Any combination of simultaneous and sequential bags is supported.");
+DEFINE_string(urdf_filenames, "",
+              "Comma-separated list of one or more URDF files that contain "
+              "static links for the sensor configuration(s).");
 DEFINE_bool(use_bag_transforms, true,
-            "Whether to read, use and republish the transforms from the bag.");
+            "Whether to read, use and republish transforms from bags.");
 DEFINE_string(pbstream_filename, "",
               "If non-empty, filename of a pbstream to load.");
 DEFINE_bool(keep_running, false,
@@ -50,21 +65,58 @@ constexpr char kTfStaticTopic[] = "/tf_static";
 constexpr char kTfTopic[] = "tf";
 constexpr double kClockPublishFrequencySec = 1. / 30.;
 constexpr int kSingleThreaded = 1;
+// We publish tf messages one second earlier than other messages. Under
+// the assumption of higher frequency tf this should ensure that tf can
+// always interpolate.
+const ::ros::Duration kDelay = ::ros::Duration(1.0);
 
-void RunOfflineNode(
-    std::unique_ptr<cartographer::mapping::MapBuilderInterface> map_builder,
-    const cartographer_ros::NodeOptions& node_options,
-    const cartographer_ros::TrajectoryOptions& trajectory_options,
-    const std::vector<std::string>& bag_filenames) {
+void RunOfflineNode(const MapBuilderFactory& map_builder_factory) {
+  CHECK(!FLAGS_configuration_directory.empty())
+      << "-configuration_directory is missing.";
+  CHECK(!FLAGS_configuration_basenames.empty())
+      << "-configuration_basenames is missing.";
+  CHECK(!FLAGS_bag_filenames.empty()) << "-bag_filenames is missing.";
+  const auto bag_filenames =
+      cartographer_ros::SplitString(FLAGS_bag_filenames, ',');
+  cartographer_ros::NodeOptions node_options;
+  const auto configuration_basenames =
+      cartographer_ros::SplitString(FLAGS_configuration_basenames, ',');
+  std::vector<TrajectoryOptions> bag_trajectory_options(1);
+  std::tie(node_options, bag_trajectory_options.at(0)) =
+      LoadOptions(FLAGS_configuration_directory, configuration_basenames.at(0));
+
+  for (size_t bag_index = 1; bag_index < bag_filenames.size(); ++bag_index) {
+    TrajectoryOptions current_trajectory_options;
+    if (bag_index < configuration_basenames.size()) {
+      std::tie(std::ignore, current_trajectory_options) = LoadOptions(
+          FLAGS_configuration_directory, configuration_basenames.at(bag_index));
+    } else {
+      current_trajectory_options = bag_trajectory_options.at(0);
+    }
+    bag_trajectory_options.push_back(current_trajectory_options);
+  }
+  CHECK_EQ(bag_trajectory_options.size(), bag_filenames.size());
+
+  // Since we preload the transform buffer, we should never have to wait for a
+  // transform. When we finish processing the bag, we will simply drop any
+  // remaining sensor data that cannot be transformed due to missing transforms.
+  node_options.lookup_transform_timeout_sec = 0.;
+
+  auto map_builder = map_builder_factory(node_options.map_builder_options);
+
   const std::chrono::time_point<std::chrono::steady_clock> start_time =
       std::chrono::steady_clock::now();
 
   tf2_ros::Buffer tf_buffer;
 
   std::vector<geometry_msgs::TransformStamped> urdf_transforms;
-  if (!FLAGS_urdf_filename.empty()) {
-    urdf_transforms =
-        ReadStaticTransformsFromUrdf(FLAGS_urdf_filename, &tf_buffer);
+  for (const std::string& urdf_filename :
+       cartographer_ros::SplitString(FLAGS_urdf_filenames, ',')) {
+    const auto current_urdf_transforms =
+        ReadStaticTransformsFromUrdf(urdf_filename, &tf_buffer);
+    urdf_transforms.insert(urdf_transforms.end(),
+                           current_urdf_transforms.begin(),
+                           current_urdf_transforms.end());
   }
 
   tf_buffer.setUsingDedicatedThread(true);
@@ -74,13 +126,6 @@ void RunOfflineNode(
     // TODO(jihoonl): LoadMap should be replaced by some better deserialization
     // of full SLAM state as non-frozen trajectories once possible
     node.LoadMap(FLAGS_pbstream_filename);
-  }
-
-  std::unordered_set<std::string> expected_sensor_ids;
-  for (const std::string& topic :
-       node.ComputeDefaultTopics(trajectory_options)) {
-    CHECK(expected_sensor_ids.insert(node.node_handle()->resolveName(topic))
-              .second);
   }
 
   ::ros::Publisher tf_publisher =
@@ -107,101 +152,136 @@ void RunOfflineNode(
       },
       false /* oneshot */, false /* autostart */);
 
-  for (const std::string& bag_filename : bag_filenames) {
+  auto bag_expected_sensor_ids =
+      node.ComputeDefaultSensorIdsForMultipleBags(bag_trajectory_options);
+  std::map<std::pair<int /* bag_index */, std::string>,
+           cartographer::mapping::TrajectoryBuilderInterface::SensorId>
+      bag_topic_to_sensor_id;
+  PlayableBagMultiplexer playable_bag_multiplexer;
+  for (size_t current_bag_index = 0; current_bag_index < bag_filenames.size();
+       ++current_bag_index) {
+    const std::string& bag_filename = bag_filenames.at(current_bag_index);
     if (!::ros::ok()) {
-      break;
+      return;
+    }
+    for (const auto& expected_sensor_id :
+         bag_expected_sensor_ids.at(current_bag_index)) {
+      const auto bag_resolved_topic = std::make_pair(
+          static_cast<int>(current_bag_index),
+          node.node_handle()->resolveName(expected_sensor_id.id));
+      if (bag_topic_to_sensor_id.count(bag_resolved_topic) != 0) {
+        LOG(ERROR) << "Sensor " << expected_sensor_id.id << " of bag "
+                   << current_bag_index << " resolves to topic "
+                   << bag_resolved_topic.second << " which is already used by "
+                   << " sensor "
+                   << bag_topic_to_sensor_id.at(bag_resolved_topic).id;
+      }
+      bag_topic_to_sensor_id[bag_resolved_topic] = expected_sensor_id;
     }
 
-    const int trajectory_id =
-        node.AddOfflineTrajectory(expected_sensor_ids, trajectory_options);
+    playable_bag_multiplexer.AddPlayableBag(PlayableBag(
+        bag_filename, current_bag_index, ros::TIME_MIN, ros::TIME_MAX, kDelay,
+        // PlayableBag::FilteringEarlyMessageHandler is used to get an early
+        // peek at the tf messages in the bag and insert them into 'tf_buffer'.
+        // When a message is retrieved by GetNextMessage() further below,
+        // we will have already inserted further 'kDelay' seconds worth of
+        // transforms into 'tf_buffer' via this lambda.
+        [&tf_publisher, &tf_buffer](const rosbag::MessageInstance& msg) {
+          if (msg.isType<tf2_msgs::TFMessage>()) {
+            if (FLAGS_use_bag_transforms) {
+              const auto tf_message = msg.instantiate<tf2_msgs::TFMessage>();
+              tf_publisher.publish(tf_message);
 
-    rosbag::Bag bag;
-    bag.open(bag_filename, rosbag::bagmode::Read);
-    rosbag::View view(bag);
-    const ::ros::Time begin_time = view.getBeginTime();
-    const double duration_in_seconds = (view.getEndTime() - begin_time).toSec();
-
-    // We need to keep 'tf_buffer' small because it becomes very inefficient
-    // otherwise. We make sure that tf_messages are published before any data
-    // messages, so that tf lookups always work.
-    std::deque<rosbag::MessageInstance> delayed_messages;
-    // We publish tf messages one second earlier than other messages. Under
-    // the assumption of higher frequency tf this should ensure that tf can
-    // always interpolate.
-    const ::ros::Duration kDelay(1.);
-    for (const rosbag::MessageInstance& msg : view) {
-      if (!::ros::ok()) {
-        break;
-      }
-
-      if (FLAGS_use_bag_transforms && msg.isType<tf2_msgs::TFMessage>()) {
-        auto tf_message = msg.instantiate<tf2_msgs::TFMessage>();
-        tf_publisher.publish(tf_message);
-
-        for (const auto& transform : tf_message->transforms) {
-          try {
-            tf_buffer.setTransform(transform, "unused_authority",
-                                   msg.getTopic() == kTfStaticTopic);
-          } catch (const tf2::TransformException& ex) {
-            LOG(WARNING) << ex.what();
+              for (const auto& transform : tf_message->transforms) {
+                try {
+                  // We need to keep 'tf_buffer' small because it becomes very
+                  // inefficient otherwise. We make sure that tf_messages are
+                  // published before any data messages, so that tf lookups
+                  // always work.
+                  tf_buffer.setTransform(transform, "unused_authority",
+                                         msg.getTopic() == kTfStaticTopic);
+                } catch (const tf2::TransformException& ex) {
+                  LOG(WARNING) << ex.what();
+                }
+              }
+            }
+            // Tell 'PlayableBag' to filter the tf message since there is no
+            // further use for it.
+            return false;
+          } else {
+            return true;
           }
-        }
-      }
+        }));
+  }
 
-      while (!delayed_messages.empty() &&
-             delayed_messages.front().getTime() < msg.getTime() - kDelay) {
-        const rosbag::MessageInstance& delayed_msg = delayed_messages.front();
-        const std::string topic = node.node_handle()->resolveName(
-            delayed_msg.getTopic(), false /* resolve */);
-        if (delayed_msg.isType<sensor_msgs::LaserScan>()) {
-          node.HandleLaserScanMessage(
-              trajectory_id, topic,
-              delayed_msg.instantiate<sensor_msgs::LaserScan>());
-        }
-        if (delayed_msg.isType<sensor_msgs::MultiEchoLaserScan>()) {
-          node.HandleMultiEchoLaserScanMessage(
-              trajectory_id, topic,
-              delayed_msg.instantiate<sensor_msgs::MultiEchoLaserScan>());
-        }
-        if (delayed_msg.isType<sensor_msgs::PointCloud2>()) {
-          node.HandlePointCloud2Message(
-              trajectory_id, topic,
-              delayed_msg.instantiate<sensor_msgs::PointCloud2>());
-        }
-        if (delayed_msg.isType<sensor_msgs::Imu>()) {
-          node.HandleImuMessage(trajectory_id, topic,
-                                delayed_msg.instantiate<sensor_msgs::Imu>());
-        }
-        if (delayed_msg.isType<nav_msgs::Odometry>()) {
-          node.HandleOdometryMessage(
-              trajectory_id, topic,
-              delayed_msg.instantiate<nav_msgs::Odometry>());
-        }
-        if (delayed_msg.isType<sensor_msgs::NavSatFix>()) {
-          node.HandleNavSatFixMessage(
-              trajectory_id, topic,
-              delayed_msg.instantiate<sensor_msgs::NavSatFix>());
-        }
-        clock.clock = delayed_msg.getTime();
-        clock_publisher.publish(clock);
+  // TODO(gaschler): Warn if resolved topics are not in bags.
+  std::unordered_map<int, int> bag_index_to_trajectory_id;
+  while (playable_bag_multiplexer.IsMessageAvailable()) {
+    const auto next_msg_tuple = playable_bag_multiplexer.GetNextMessage();
+    const rosbag::MessageInstance& msg = std::get<0>(next_msg_tuple);
+    const int bag_index = std::get<1>(next_msg_tuple);
+    const bool is_last_message_in_bag = std::get<2>(next_msg_tuple);
 
-        LOG_EVERY_N(INFO, 100000)
-            << "Processed " << (delayed_msg.getTime() - begin_time).toSec()
-            << " of " << duration_in_seconds << " bag time seconds...";
-
-        delayed_messages.pop_front();
-      }
-
-      const std::string topic =
-          node.node_handle()->resolveName(msg.getTopic(), false /* resolve */);
-      if (expected_sensor_ids.count(topic) == 0) {
-        continue;
-      }
-      delayed_messages.push_back(msg);
+    int trajectory_id;
+    // Lazily add trajectories only when the first message arrives in order
+    // to avoid blocking the sensor queue.
+    if (bag_index_to_trajectory_id.count(bag_index) == 0) {
+      trajectory_id =
+          node.AddOfflineTrajectory(bag_expected_sensor_ids.at(bag_index),
+                                    bag_trajectory_options.at(bag_index));
+      CHECK(bag_index_to_trajectory_id
+                .emplace(std::piecewise_construct,
+                         std::forward_as_tuple(bag_index),
+                         std::forward_as_tuple(trajectory_id))
+                .second);
+      LOG(INFO) << "Assigned trajectory " << trajectory_id << " to bag "
+                << bag_filenames.at(bag_index);
+    } else {
+      trajectory_id = bag_index_to_trajectory_id.at(bag_index);
     }
 
-    bag.close();
-    node.FinishTrajectory(trajectory_id);
+    if (!::ros::ok()) {
+      return;
+    }
+    const auto bag_topic = std::make_pair(
+        bag_index,
+        node.node_handle()->resolveName(msg.getTopic(), false /* resolve */));
+    auto it = bag_topic_to_sensor_id.find(bag_topic);
+    if (it != bag_topic_to_sensor_id.end()) {
+      const std::string& sensor_id = it->second.id;
+      if (msg.isType<sensor_msgs::LaserScan>()) {
+        node.HandleLaserScanMessage(trajectory_id, sensor_id,
+                                    msg.instantiate<sensor_msgs::LaserScan>());
+      }
+      if (msg.isType<sensor_msgs::MultiEchoLaserScan>()) {
+        node.HandleMultiEchoLaserScanMessage(
+            trajectory_id, sensor_id,
+            msg.instantiate<sensor_msgs::MultiEchoLaserScan>());
+      }
+      if (msg.isType<sensor_msgs::PointCloud2>()) {
+        node.HandlePointCloud2Message(
+            trajectory_id, sensor_id,
+            msg.instantiate<sensor_msgs::PointCloud2>());
+      }
+      if (msg.isType<sensor_msgs::Imu>()) {
+        node.HandleImuMessage(trajectory_id, sensor_id,
+                              msg.instantiate<sensor_msgs::Imu>());
+      }
+      if (msg.isType<nav_msgs::Odometry>()) {
+        node.HandleOdometryMessage(trajectory_id, sensor_id,
+                                   msg.instantiate<nav_msgs::Odometry>());
+      }
+      if (msg.isType<sensor_msgs::NavSatFix>()) {
+        node.HandleNavSatFixMessage(trajectory_id, sensor_id,
+                                    msg.instantiate<sensor_msgs::NavSatFix>());
+      }
+    }
+    clock.clock = msg.getTime();
+    clock_publisher.publish(clock);
+
+    if (is_last_message_in_bag) {
+      node.FinishTrajectory(trajectory_id);
+    }
   }
 
   // Ensure the clock is republished after the bag has been finished, during the

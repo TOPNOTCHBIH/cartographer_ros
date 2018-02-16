@@ -19,6 +19,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -34,6 +35,7 @@
 #include "cartographer_ros_msgs/FinishTrajectory.h"
 #include "cartographer_ros_msgs/SensorTopics.h"
 #include "cartographer_ros_msgs/StartTrajectory.h"
+#include "cartographer_ros_msgs/StatusResponse.h"
 #include "cartographer_ros_msgs/SubmapEntry.h"
 #include "cartographer_ros_msgs/SubmapList.h"
 #include "cartographer_ros_msgs/SubmapQuery.h"
@@ -73,13 +75,19 @@ class Node {
   // Starts the first trajectory with the default topics.
   void StartTrajectoryWithDefaultTopics(const TrajectoryOptions& options);
 
-  // Compute the default topics for the given 'options'.
-  std::unordered_set<std::string> ComputeDefaultTopics(
-      const TrajectoryOptions& options);
+  // Returns unique SensorIds for multiple input bag files based on
+  // their TrajectoryOptions.
+  // 'SensorId::id' is the expected ROS topic name.
+  std::vector<
+      std::set<::cartographer::mapping::TrajectoryBuilderInterface::SensorId>>
+  ComputeDefaultSensorIdsForMultipleBags(
+      const std::vector<TrajectoryOptions>& bags_options) const;
 
   // Adds a trajectory for offline processing, i.e. not listening to topics.
   int AddOfflineTrajectory(
-      const std::unordered_set<std::string>& expected_sensor_ids,
+      const std::set<
+          cartographer::mapping::TrajectoryBuilderInterface::SensorId>&
+          expected_sensor_ids,
       const TrajectoryOptions& options);
 
   // The following functions handle adding sensor data to a trajectory.
@@ -127,10 +135,12 @@ class Node {
       cartographer_ros_msgs::FinishTrajectory::Response& response);
   bool HandleWriteState(cartographer_ros_msgs::WriteState::Request& request,
                         cartographer_ros_msgs::WriteState::Response& response);
-  // Returns the set of topic names we want to subscribe to.
-  std::unordered_set<std::string> ComputeExpectedTopics(
+  // Returns the set of SensorIds expected for a trajectory.
+  // 'SensorId::id' is the expected ROS topic name.
+  std::set<::cartographer::mapping::TrajectoryBuilderInterface::SensorId>
+  ComputeExpectedSensorIds(
       const TrajectoryOptions& options,
-      const cartographer_ros_msgs::SensorTopics& topics);
+      const cartographer_ros_msgs::SensorTopics& topics) const;
   int AddTrajectory(const TrajectoryOptions& options,
                     const cartographer_ros_msgs::SensorTopics& topics);
   void LaunchSubscribers(const TrajectoryOptions& options,
@@ -141,12 +151,14 @@ class Node {
   void AddSensorSamplers(int trajectory_id, const TrajectoryOptions& options);
   void PublishTrajectoryStates(const ::ros::WallTimerEvent& timer_event);
   void PublishTrajectoryNodeList(const ::ros::WallTimerEvent& timer_event);
+  void PublishLandmarkPosesList(const ::ros::WallTimerEvent& timer_event);
   void PublishConstraintList(const ::ros::WallTimerEvent& timer_event);
   void SpinOccupancyGridThreadForever();
   bool ValidateTrajectoryOptions(const TrajectoryOptions& options);
   bool ValidateTopicNames(const ::cartographer_ros_msgs::SensorTopics& topics,
                           const TrajectoryOptions& options);
-  bool FinishTrajectoryUnderLock(int trajectory_id) REQUIRES(mutex_);
+  cartographer_ros_msgs::StatusResponse FinishTrajectoryUnderLock(
+      int trajectory_id) REQUIRES(mutex_);
 
   const NodeOptions node_options_;
 
@@ -158,6 +170,7 @@ class Node {
   ::ros::NodeHandle node_handle_;
   ::ros::Publisher submap_list_publisher_;
   ::ros::Publisher trajectory_node_list_publisher_;
+  ::ros::Publisher landmark_poses_list_publisher_;
   ::ros::Publisher constraint_list_publisher_;
   // These ros::ServiceServers need to live for the lifetime of the node.
   std::vector<::ros::ServiceServer> service_servers_;

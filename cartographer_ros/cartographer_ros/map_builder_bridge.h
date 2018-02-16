@@ -18,13 +18,14 @@
 #define CARTOGRAPHER_ROS_MAP_BUILDER_BRIDGE_H_
 
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "cartographer/common/mutex.h"
 #include "cartographer/mapping/map_builder_interface.h"
 #include "cartographer/mapping/proto/trajectory_builder_options.pb.h"
+#include "cartographer/mapping/trajectory_builder_interface.h"
 #include "cartographer_ros/node_options.h"
 #include "cartographer_ros/sensor_bridge.h"
 #include "cartographer_ros/tf_bridge.h"
@@ -63,13 +64,16 @@ class MapBuilderBridge {
   MapBuilderBridge& operator=(const MapBuilderBridge&) = delete;
 
   void LoadMap(const std::string& map_filename);
-  int AddTrajectory(const std::unordered_set<std::string>& expected_sensor_ids,
-                    const TrajectoryOptions& trajectory_options);
+  int AddTrajectory(
+      const std::set<
+          ::cartographer::mapping::TrajectoryBuilderInterface::SensorId>&
+          expected_sensor_ids,
+      const TrajectoryOptions& trajectory_options);
   void FinishTrajectory(int trajectory_id);
   void RunFinalOptimization();
-  void SerializeState(const std::string& filename);
+  bool SerializeState(const std::string& filename);
 
-  bool HandleSubmapQuery(
+  void HandleSubmapQuery(
       cartographer_ros_msgs::SubmapQuery::Request& request,
       cartographer_ros_msgs::SubmapQuery::Response& response);
 
@@ -77,6 +81,7 @@ class MapBuilderBridge {
   std::unordered_map<int, TrajectoryState> GetTrajectoryStates()
       EXCLUDES(mutex_);
   visualization_msgs::MarkerArray GetTrajectoryNodeList();
+  visualization_msgs::MarkerArray GetLandmarkPosesList();
   visualization_msgs::MarkerArray GetConstraintList();
 
   SensorBridge* sensor_bridge(int trajectory_id);
@@ -96,6 +101,8 @@ class MapBuilderBridge {
       trajectory_state_data_ GUARDED_BY(mutex_);
   std::unique_ptr<cartographer::mapping::MapBuilderInterface> map_builder_;
   tf2_ros::Buffer* const tf_buffer_;
+
+  std::unordered_map<std::string /* landmark ID */, int> landmark_to_index_;
 
   // These are keyed with 'trajectory_id'.
   std::unordered_map<int, TrajectoryOptions> trajectory_options_;

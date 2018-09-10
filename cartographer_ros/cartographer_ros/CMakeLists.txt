@@ -124,6 +124,17 @@ install(TARGETS cartographer_dev_trajectory_comparison
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+google_binary(cartographer_dev_pbstream_to_png_canvas
+  SRCS
+  dev/pbstream_to_png_canvas_main.cc
+)
+
+install(TARGETS cartographer_dev_pbstream_to_png_canvas
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 # TODO(cschuet): Add support for shared library case.
 if (${BUILD_GRPC})
   google_binary(cartographer_grpc_node

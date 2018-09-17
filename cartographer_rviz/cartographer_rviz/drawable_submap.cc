@@ -135,6 +135,15 @@ bool DrawableSubmap::MaybeFetchTexture(ros::ServiceClient* const client) {
     absl::MutexLock locker(&mutex_);
     query_in_progress_ = false;
     if (submap_textures != nullptr) {
+      constexpr int factor = 4;
+      for (auto& submap_texture : submap_textures->textures) {
+        for (char& alpha : submap_texture.pixels.alpha) {
+          alpha = std::max(0, std::min(255, factor * alpha));
+        }
+        for (char& intensity : submap_texture.pixels.intensity) {
+          intensity = std::max(0, std::min(255, factor * intensity));
+        }
+      }
       // We emit a signal to update in the right thread, and pass via the
       // 'submap_texture_' member to simplify the signal-slot connection
       // slightly.

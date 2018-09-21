@@ -77,10 +77,15 @@ void Run(const std::string& pbstream_filename, const double resolution,
         image_canvas.SetPixel(canvas_x, canvas_y, background_color);
         continue;
       }
-      // Red (first) channel is occupancy.
-      const auto value =
+      const uint16_t intensity =
           image_slice.GetPixel(x_in_image_slice, y_in_image_slice)[0];
-      const ::cartographer::io::Uint8Color color{{value, value, value}};
+      const uint16_t alpha =
+          image_slice.GetPixel(x_in_image_slice, y_in_image_slice)[1];
+      ::cartographer::io::Uint8Color color;
+      for (int i = 0; i < 3; ++i) {
+        color[i] =
+            (intensity * alpha + (background_color[i] * (255 - alpha))) / 256;
+      }
       image_canvas.SetPixel(canvas_x, canvas_y, color);
     }
   }

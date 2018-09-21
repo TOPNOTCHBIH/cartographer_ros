@@ -28,6 +28,7 @@ for FILENAME in "$DIR"/*.pbstream; do
   echo "Reading ${FILENAME}"
   rosrun cartographer_ros cartographer_dev_pbstream_to_png_canvas \
     --pbstream_filename="${FILENAME}" "${@:2}"
+  convert "${FILENAME}.png" -level 10%,60% "${FILENAME}.png"
 done
 
 (cd $DIR &&
